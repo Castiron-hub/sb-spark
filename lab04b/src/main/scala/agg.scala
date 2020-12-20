@@ -46,12 +46,12 @@ object agg extends App {
         min("value.timestamp") / lit(1000) as "start_ts",
         max("value.timestamp") / lit(1000) as "end_ts",
         sum(when(col("value.event_type") === lit("buy"), col("value.item_price"))
-        .otherwise(lit(0))) as "revenue",
-        count("value.uid") as "visitors",
+          .otherwise(lit(0))) as "revenue",
         sum(when(col("value.event_type") === lit("buy"), lit(1))
-          .otherwise(lit(0))) as "purchases")
+          .otherwise(lit(0))) as "purchases",
+        count("value.uid") as "visitors")
       .withColumn("aov", col("revenue") / col("purchases"))
-      .select("start_ts", "end_ts", "revenue", "purchases", "visitors", "aov")
+      .select("start_ts", "end_ts", "revenue", "visitors", "purchases","aov")
 
     val dfWriter = groupDF
       .toJSON
@@ -64,9 +64,6 @@ object agg extends App {
       .option("checkpointLocation", s"chk/lab04b")
       .start
 
-    while (true) {
-      dfWriter.awaitTermination(10000)
-    }
 
   }
 }
