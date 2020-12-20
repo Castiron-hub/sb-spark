@@ -40,7 +40,7 @@ object agg extends App {
       .withColumn("value.timestamp", col("value.timestamp") / lit(1000))
       .withColumn("ts", to_timestamp(col("value.timestamp") / lit(1000)))
       .withColumn("value.item_price", col("value.item_price").cast(DoubleType))
-      .withWatermark("timestamp", "2 hours")
+      .withWatermark("timestamp", "1 hours")
       .groupBy(window(col("ts"), "1 hour"))
       .agg(
         min("value.timestamp") / lit(1000) as "start_ts",
