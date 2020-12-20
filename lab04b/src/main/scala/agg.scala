@@ -2,6 +2,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.types.{DoubleType, LongType, StringType, StructField, StructType, TimestampType}
+import org.apache.spark.sql.Dataset
 
 object agg extends App {
 
