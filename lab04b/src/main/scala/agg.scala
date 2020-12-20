@@ -2,9 +2,6 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.types.{DoubleType, LongType, StringType, StructField, StructType, TimestampType}
-import org.apache.spark.sql.Dataset
-import org.apache.spark.sql.DataFrame
-
 
 object agg extends App {
 
@@ -26,54 +23,50 @@ object agg extends App {
         StructField("timestamp", LongType) :: Nil
     )
 
-    def createConsoleSink(chkName: String, df: DataFrame) = {
-      df
-        .writeStream
-        .format("console")
-        .trigger(Trigger.ProcessingTime("30 seconds"))
-        .option("checkpointLocation", s"chk/$chkName")
-        .option("truncate", "false")
-        .option("numRows", "1000")
+    val kafkaTopic = "ivan_shishkin"
+    val offset = "earliest"
+    val df = spark
+      .readStream
+      .format("kafka")
+      .option("subscribe", kafkaTopic)
+      .option("kafka.bootstrap.servers", "spark-master-1:6667")
+      .option("maxOffsetsPerTrigger", "100")
+      .option("startingOffsets", offset)
+      .load
+      .withColumn("value", from_json(col("value").cast(StringType), schema))
+
+
+    val groupDF = df
+      .withColumn("value.timestamp", col("value.timestamp") / lit(1000))
+      .withColumn("ts", to_timestamp(col("value.timestamp") / lit(1000)))
+      .withColumn("value.item_price", col("value.item_price").cast(DoubleType))
+      .withWatermark("timestamp", "1 hours")
+      .groupBy(window(col("ts"), "1 hour"))
+      .agg(
+        min("value.timestamp") / lit(1000) as "start_ts",
+        max("value.timestamp") / lit(1000) as "end_ts",
+        sum(when(col("value.event_type") === lit("buy"), col("value.item_price"))
+        .otherwise(lit(0))) as "revenue",
+        count("value.uid") as "visitors",
+        sum(when(col("value.event_type") === lit("buy"), lit(1))
+          .otherwise(lit(0))) as "purchases")
+      .withColumn("aov", col("revenue") / col("purchases"))
+      .select("start_ts", "end_ts", "revenue", "purchases", "visitors", "aov")
+
+    val dfWriter = groupDF
+      .toJSON
+      .withColumn("topic", lit("ivan_shishkin_lab04b_out"))
+      .writeStream
+      .outputMode("update")
+      .format("kafka")
+      .trigger(Trigger.ProcessingTime("5 seconds"))
+      .option("kafka.bootstrap.servers", "10.0.0.5:6667")
+      .option("checkpointLocation", s"chk/lab04b")
+      .start
+
+    while (true) {
+      dfWriter.awaitTermination(10000)
     }
-    val kafkaParams = Map(
-      "kafka.bootstrap.servers" -> "spark-master-1:6667",
-      "subscribe" -> "ivan_shishkin",
-      "startingOffsets" -> "earliest",
-      "kafkaConsumer.pollTimeoutMs"-> "300000",
-      "kafka.session.timeout.ms"-> "30000"
-    )
-
-
-    val sdf = spark.readStream.format("kafka").options(kafkaParams).load
-      .select(
-        from_json('value.cast(StringType) ,schemaFromClass).as("js"),
-        'topic,
-        'partition,
-        'offset
-      )
-      .select(
-        $"js.category",
-        $"js.event_type",
-        $"js.item_price",
-        $"js.uid",
-        to_timestamp(from_unixtime($"js.timestamp"/1000)).as("timestamp"),
-        'topic,
-        'partition,
-        'offset
-      )
-      .withWatermark("timestamp", "1 hour")
-      .groupBy(
-        window(col("timestamp"), "1 hour", "1 hour")
-      ).count
-
-    def writeKafka[T](topic: String, data: Dataset[T]): Unit = {
-      val kafkaParams = Map(
-        "kafka.bootstrap.servers" -> "10.0.0.5:6667"
-      )
-
-      data.toJSON.withColumn("topic", lit(topic)).write.format("kafka").options(kafkaParams).save
-    }
-    writeKafka("ivan_shishkin_lab04b_out", sdf)
 
   }
 }
