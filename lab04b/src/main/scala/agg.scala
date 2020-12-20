@@ -1,69 +1,54 @@
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.streaming.Trigger
-import org.apache.spark.sql.types.{DoubleType, LongType, StringType, StructField, StructType, TimestampType}
+import org.apache.spark.sql.DataFrame
+import scala.collection.JavaConverters._
 
 object agg extends App {
+  val spark = SparkSession.builder().appName("filter").getOrCreate()
 
-  override def main(args: Array[String]): Unit = {
-    val spark = SparkSession
-      .builder()
-      .appName("Spark Stateful Streaming")
-      .master("local[1]")
-      .getOrCreate()
+  import spark.implicits._
 
-    spark.sparkContext.setLogLevel("WARN")
+  val topicName = "ivan_shishkin"
 
-    val schema = StructType(
-      StructField("event_type", StringType) ::
-        StructField("category", StringType) ::
-        StructField("item_id", StringType) ::
-        StructField("item_price", StringType) ::
-        StructField("uid", StringType) ::
-        StructField("timestamp", LongType) :: Nil
-    )
+  val sdf = spark
+    .readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "spark-master-1:6667")
+    .option("subscribe", topicName)
+    .load()
 
-    val kafkaTopic = "ivan_shishkin"
-    val offset = "earliest"
-    val df = spark
-      .readStream
+  val parsedSdf = sdf
+    .select(json_tuple('value.cast("string"), "category", "event_type", "item_id", "item_price", "timestamp", "uid"))
+    .select('c0.alias("category"), 'c1.alias("event_type"), 'c2.alias("item_id"), 'c3.alias("item_price"), 'c4.alias("timestamp"), 'c5.alias("uid"))
+    .withColumn("timestamp", (col("timestamp")/1000).cast("timestamp"))
+
+  val dfForKafka = parsedSdf
+    .groupBy(window('timestamp, "1 hour", "1 hour"))
+    .agg(sum(when('event_type === "buy", 'item_price).otherwise(0)).alias("revenue"),
+      sum(when('event_type === "buy", 1).otherwise(0)).alias("purchases"),
+      sum(when('uid.isNotNull, 1).otherwise(0)).alias("visitors"))
+    .withColumn("aov", 'revenue/'purchases)
+    .withColumn("start_ts", unix_timestamp(col("window.start")))
+    .withColumn("end_ts", unix_timestamp(col("window.end")))
+    .select('start_ts, 'end_ts, 'revenue, 'visitors, 'purchases, 'aov)
+
+  val columns = dfForKafka.columns.map((col))
+
+  val dfAgg = dfForKafka.select((to_json(struct(columns:_*)).alias("value")))
+
+  val sink = createKafkaSink(dfAgg, topicName)
+  val sq = sink.start()
+  sq.awaitTermination()
+
+  def createKafkaSink(df: DataFrame, topicName: String) = {
+    df.writeStream
       .format("kafka")
-      .option("subscribe", kafkaTopic)
-      .option("kafka.bootstrap.servers", "spark-master-1:6667")
-      .option("maxOffsetsPerTrigger", "100")
-      .option("startingOffsets", offset)
-      .load
-      .withColumn("value", from_json(col("value").cast(StringType), schema))
-
-
-    val groupDF = df
-      .withColumn("value.timestamp", col("value.timestamp") / lit(1000))
-      .withColumn("ts", to_timestamp(col("value.timestamp") / lit(1000)))
-      .withColumn("value.item_price", col("value.item_price").cast(DoubleType))
-      .withWatermark("timestamp", "1 hour")
-      .groupBy(window(col("ts"), "1 hour"))
-      .agg(
-        min("value.timestamp") / lit(1000) as "start_ts",
-        max("value.timestamp") / lit(1000) as "end_ts",
-        sum(when(col("value.event_type") === lit("buy"), col("value.item_price"))
-          .otherwise(lit(0))) as "revenue",
-        sum(when(col("value.event_type") === lit("buy"), lit(1))
-          .otherwise(lit(0))) as "purchases",
-        count("value.uid") as "visitors")
-      .withColumn("aov", col("revenue") / col("purchases"))
-      .select("start_ts", "end_ts", "revenue", "visitors", "purchases","aov")
-
-    val dfWriter = groupDF
-      .toJSON
-      .withColumn("topic", lit("ivan_shishkin_lab04b_out"))
-      .writeStream
       .outputMode("update")
-      .format("kafka")
-      .trigger(Trigger.ProcessingTime("5 seconds"))
+      .option("checkpointLocation", "chk/"+topicName)
       .option("kafka.bootstrap.servers", "10.0.0.5:6667")
-      .option("checkpointLocation", s"chk/lab04b")
-      .start
-
-
+      .option("topic", topicName + "_lab04b_out")
+      .trigger(Trigger.ProcessingTime("5 seconds"))
   }
 }
