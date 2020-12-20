@@ -3,6 +3,8 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.types.{DoubleType, LongType, StringType, StructField, StructType, TimestampType}
 import org.apache.spark.sql.Dataset
+import org.apache.spark.sql.DataFrame
+
 
 object agg extends App {
 
