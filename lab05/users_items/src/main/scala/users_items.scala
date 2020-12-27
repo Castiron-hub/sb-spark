@@ -1,90 +1,104 @@
-import org.apache.spark.sql.{Column, DataFrame, SaveMode, SparkSession}
+import org.apache.log4j.{Level, Logger}
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.hadoop.fs.{FileSystem, Path}
 
-object users_items extends App {
-
-    val spark = SparkSession
-      .builder()
-      .appName("Spark SQL users items")
-      .master("local[*]")
-      .getOrCreate()
-
-    spark.conf.set("spark.sql.session.timeZone", "UTC")
-
-    var outDir: String = spark.conf.get("spark.users_items.output_dir")
-    var inDir: String = spark.conf.get("spark.users_items.input_dir")
-
-    println("out dir param is: " + outDir)
-    println("inp dir param is: " + inDir)
-
-    //задать дефолтный режим 1, а если задан параметр спарк то переопределить его
-    val mode: String = try {
-        spark.conf.get("spark.users_items.update", "1")
-    } catch {
-        case _: Throwable => println("mode default")
-            "1"
+object Utils {
+    val checkPoint = "check"
+    def delete(sc:SparkContext, path:String): Unit ={
+        val fs = FileSystem.get(sc.hadoopConfiguration)
+        val outPutPath = new Path(path)
+        if (fs.exists(outPutPath)) {
+            fs.delete(outPutPath, true)
+            println(s"$path deleted.")
+        }
     }
 
-    def readJson(dir: String): DataFrame = {
-        spark.read.json(dir)
-          .na.drop(Seq("uid"))
-          .withColumn("item_id", lower(col("item_id")))
-          .withColumn("item_id", regexp_replace(col("item_id"), lit("[- ]"), lit("_")))
+    def expr(myCols: Set[String], allCols: Set[String]) = {
+        allCols.toList.map(x => x match {
+            case x if myCols.contains(x) => col(x)
+            case _ => lit(null).as(x)
+        })
     }
 
-    val sdfBuy = readJson(s"$inDir/buy/**/")
-    val sdfView = readJson(s"$inDir/view/**/")
-
-    def pivotDF(dataFrame: DataFrame): DataFrame = {
-        dataFrame
-          .groupBy("uid")
-          .pivot("item_id")
-          .agg(count("uid"))
+    def getAndSaveDate(df:DataFrame)(implicit spark: SparkSession) = {
+        import spark.implicits._
+        val dat = df.select('date).groupBy().agg(max('date).alias("part"))
+        dat.write.csv(checkPoint)
+        val part = dat.collect().map(r=>r(0)).toList.head.toString
+        part
     }
 
-    val buyPiv = pivotDF(sdfBuy)
-    val viewPiv = pivotDF(sdfView)
-
-    val oldColumnsBuy = buyPiv.columns
-    val oldColumnsView = viewPiv.columns
-
-    def formatColumnNames(cols: Array[String], dfType: String): Array[String] = {
-        cols
-          .map(col =>  if (col.equals("uid")) col else dfType + col)
+    def loadAndGetDate(implicit spark: SparkSession) = {
+        val dat = spark.read.csv(checkPoint).select("*")
+        dat.show()
+        val part = dat.collect().map(r=>r(0)).toList.head.toString
+        part
     }
 
-    val newColumnsBuy = formatColumnNames(oldColumnsBuy,"buy_")
-    val newColumnsView = formatColumnNames(oldColumnsView,"view_")
-
-    def getColumns(oldCols: Array[String], newCols: Array[String]): Array[Column] = {
-        oldCols.zip(newCols).map(f => col(f._1).as(f._2))
+    def readAndTransform(input_dir:String)(implicit spark: SparkSession) = {
+        import spark.implicits._
+        val viewDf = spark.read.json(input_dir + "/view")
+        val buyDf = spark.read.json(input_dir + "/buy")
+        val unionDF = buyDf.union(viewDf)
+        val usersDF = unionDF.select("*")
+          .withColumn("cat", concat(col("event_type"), lit("_"), regexp_replace(lower('item_id), "[- ]", "_")))
+          .groupBy(col("uid")).pivot(col("cat")).count()
+        val colNames = usersDF.schema.fields.map{x => x.name}
+        val usersDF0 = usersDF.na.fill(0L, colNames)
+        (usersDF0, getAndSaveDate(unionDF))
     }
 
-    val columnsBuy = getColumns(oldColumnsBuy, newColumnsBuy)
-    val columnsView = getColumns(oldColumnsView, newColumnsView)
-
-    val buyRenamed = buyPiv.select(columnsBuy: _*).na.fill(0, newColumnsBuy)
-    val viewRenamed = viewPiv.select(columnsView: _*).na.fill(0, newColumnsView)
-
-    val fullJoin = buyRenamed.join(viewRenamed, Seq("uid"), "outer")
-
-    val fullJoinCols = fullJoin.columns
-
-    val dfAll = fullJoin.na.fill(0, fullJoinCols)
-
-    val maxDate = spark.read.json(s"$inDir/**/**")
-      .agg(max(col("date"))).first().getString(0)
-
-    if (mode == "0") {
-        dfAll.coalesce(1).write.mode(SaveMode.Overwrite).parquet(s"$outDir/$maxDate")
+    def modeUpdate(input_dir:String, output_dir:String, sc:SparkContext)(implicit spark: SparkSession) = {
+        val part = "20200429"//loadAndGetDate
+        delete(sc, checkPoint)
+        println("Updating...")
+        val userDFOld = spark.read.parquet(output_dir + "/" + part)
+        val tuple = readAndTransform(input_dir)
+        val userDFNew = tuple._1
+        val cols1 = userDFOld.columns.toSet
+        val cols2 = userDFNew.columns.toSet
+        val total = cols1 ++ cols2
+        userDFOld
+          .select(expr(cols1, total):_*)
+          .union(userDFNew.select(expr(cols2, total):_*))
+          .write.parquet(output_dir + "/" + tuple._2)
+        //tuple._1.union(userDFOld).write.parquet(output_dir + "/" + tuple._2)
     }
-    else if (mode == "1") {
-        val previousDF = spark.read.parquet(s"$outDir/**")
-        val previousUid = previousDF.select(col("uid")).rdd.map(r => r(0)).collect()
-        val dfAppend = dfAll.where(!col("uid").isin(previousUid: _*))
-        println("dfAppend schema is:")
-        dfAppend.printSchema()
-        dfAppend.coalesce(1).write.mode(SaveMode.Overwrite).parquet(s"$outDir/$maxDate")
+
+    def modeInsert(input_dir:String, output_dir:String, sc:SparkContext)(implicit spark: SparkSession) = {
+        println("Try to delete checkpoint.")
+        delete(sc, checkPoint)
+        delete(sc, output_dir)
+        println("Inserting...")
+        val tuple = readAndTransform(input_dir)
+        tuple._1.write.parquet(output_dir + "/" + tuple._2)
     }
 
 }
+
+
+object users_items extends App{
+    override def main(args: Array[String]): Unit = {
+        Logger.getLogger("org").setLevel(Level.ERROR)
+        Logger.getLogger("akka").setLevel(Level.ERROR)
+        val conf = new SparkConf().setAppName("ivan.shishkin:lab05")//.setMaster("local")
+        val sc = new SparkContext(conf)
+        implicit val spark = SparkSession.builder().config(sc.getConf).getOrCreate()
+        val mode = conf.get("spark.users_items.update").toInt
+        implicit val output_dir = conf.get("spark.users_items.output_dir")
+        implicit val input_dir = conf.get("spark.users_items.input_dir")
+        println(s"mode: $mode")
+        println(s"output_dir: $output_dir")
+        println(s"input_dir: $input_dir")
+        if (mode == 0)
+            Utils.modeInsert(input_dir, output_dir, sc)
+        else
+            Utils.modeUpdate(input_dir, output_dir, sc)
+        spark.stop
+    }
+}
+
+
