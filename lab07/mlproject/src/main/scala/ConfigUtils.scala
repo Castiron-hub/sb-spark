@@ -3,7 +3,7 @@ import org.apache.spark.sql.SparkSession
 object ConfigUtils {
 
   private val pipeline_model: String = "/user/ivan.shishkin/pipeline_model"
-  private val weblogs_file: String = "hdfs:///labs/laba07/weblogs_train_merged_labels.json"
+  private val weblogs_file: String = "hdfs:///labs/laba07/laba07.json"
   private val in_topic_name  = "ivan_shishkin"
   private val out_topic_name = "ivan_shishkin_lab04b_out"
 
